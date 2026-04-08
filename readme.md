@@ -13,6 +13,8 @@ Use the prepared Google Sheet, make your own copy, fill in your settings, and st
 
 Recommended if you want the fastest setup.
 
+Link to the template: [Google Sheet Template](https://docs.google.com/spreadsheets/d/19pl6DDEC1eCnRiqdfkiBjJYJ3-lU8EihUocClMUxaCM/edit?usp=drive_link)
+
 ### Option 2: Create your own Google Sheet and add the script manually
 Create a blank Google Sheet, add the required sheets and columns, paste the script into Google Apps Script, and use it with your own data.
 

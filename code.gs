@@ -2,11 +2,13 @@
  * Load config values from "config" sheet.
  */
 const CONFIG = {
-  API_URL: 'https://smsgateway24.com/getdata/addsms',
+  API_URL: 'https://smsgateway24.com/getdata/addalotofsms',
   SHEET_NAME: 'Sheet1',
   CONFIG_SHEET_NAME: 'config',
   START_ROW: 2,
+  BATCH_SIZE: 50,
 };
+
 function loadConfig() {
   const sheet = SpreadsheetApp.getActiveSpreadsheet()
     .getSheetByName(CONFIG.CONFIG_SHEET_NAME);
@@ -16,7 +18,6 @@ function loadConfig() {
   }
 
   const data = sheet.getDataRange().getValues();
-
   const configMap = {};
 
   for (let i = 1; i < data.length; i++) {
@@ -28,7 +29,6 @@ function loadConfig() {
     }
   }
 
-  // Validation
   if (!configMap.api_token) {
     throw new Error('api_token is missing in config sheet');
   }
@@ -85,8 +85,8 @@ function prepareSheet() {
  */
 function sendSmsBatch() {
   const runtimeConfig = loadConfig();
-  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(CONFIG.SHEET_NAME)
-    || SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  const spreadsheet = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = spreadsheet.getSheetByName(CONFIG.SHEET_NAME) || spreadsheet.getActiveSheet();
 
   const lastRow = sheet.getLastRow();
 
@@ -97,6 +97,8 @@ function sendSmsBatch() {
 
   const dataRange = sheet.getRange(CONFIG.START_ROW, 1, lastRow - CONFIG.START_ROW + 1, 9);
   const rows = dataRange.getValues();
+
+  const smsQueue = [];
 
   for (let i = 0; i < rows.length; i++) {
     const rowIndex = CONFIG.START_ROW + i;
@@ -117,6 +119,7 @@ function sendSmsBatch() {
     if (!phone) {
       sheet.getRange(rowIndex, 7).setValue('ERROR');
       sheet.getRange(rowIndex, 8).setValue('Phone is empty');
+      sheet.getRange(rowIndex, 9).setValue('');
       continue;
     }
 
@@ -125,64 +128,87 @@ function sendSmsBatch() {
       message = `Hello ${name || 'customer'}, this is a message from our service.`;
     }
 
-    try {
-      const result = sendSms({
-        phone,
-        message,
-        timetosend,
-        customerid,
-        urgent
-      }, runtimeConfig);
+    const smsItem = {
+      sendto: normalizePhone(phone),
+      body: message,
+      sim: runtimeConfig.sim,
+      device_id: runtimeConfig.deviceId
+    };
 
-      if (result.success) {
-        sheet.getRange(rowIndex, 7).setValue('SENT');
-        sheet.getRange(rowIndex, 8).setValue(result.message || result.rawResponse);
-        sheet.getRange(rowIndex, 9).setValue(result.smsId || '');
-      } else {
-        sheet.getRange(rowIndex, 7).setValue('FAILED');
-        sheet.getRange(rowIndex, 8).setValue(result.message || result.rawResponse);
-        sheet.getRange(rowIndex, 9).setValue(result.smsId || '');
+    if (timetosend) {
+      smsItem.timetosend = timetosend;
+    }
+
+    if (customerid) {
+      smsItem.customerid = customerid;
+    }
+
+    if (urgent !== '') {
+      smsItem.urgent = Number(urgent);
+    }
+
+    smsQueue.push({
+      rowIndex: rowIndex,
+      smsItem: smsItem
+    });
+  }
+
+  if (smsQueue.length === 0) {
+    SpreadsheetApp.getUi().alert('No SMS to send.');
+    return;
+  }
+
+  for (let i = 0; i < smsQueue.length; i += CONFIG.BATCH_SIZE) {
+    const batch = smsQueue.slice(i, i + CONFIG.BATCH_SIZE);
+
+    try {
+      const result = sendSmsBulk(batch, runtimeConfig);
+
+      for (let j = 0; j < batch.length; j++) {
+        const rowIndex = batch[j].rowIndex;
+
+        if (result.success) {
+          sheet.getRange(rowIndex, 7).setValue('SENT');
+          sheet.getRange(rowIndex, 8).setValue(result.message || result.rawResponse);
+          sheet.getRange(rowIndex, 9).setValue('');
+        } else {
+          sheet.getRange(rowIndex, 7).setValue('FAILED');
+          sheet.getRange(rowIndex, 8).setValue(result.message || result.rawResponse);
+          sheet.getRange(rowIndex, 9).setValue('');
+        }
       }
     } catch (error) {
-      sheet.getRange(rowIndex, 7).setValue('ERROR');
-      sheet.getRange(rowIndex, 8).setValue(error.message);
-      sheet.getRange(rowIndex, 9).setValue('');
+      for (let j = 0; j < batch.length; j++) {
+        const rowIndex = batch[j].rowIndex;
+        sheet.getRange(rowIndex, 7).setValue('ERROR');
+        sheet.getRange(rowIndex, 8).setValue(error.message);
+        sheet.getRange(rowIndex, 9).setValue('');
+      }
     }
 
     SpreadsheetApp.flush();
-    Utilities.sleep(300); // Small pause to reduce API burst load
+    Utilities.sleep(500); // Small pause between batches
   }
 
   SpreadsheetApp.getUi().alert('Batch sending completed.');
 }
 
 /**
- * Send single SMS via smsgateway24 API.
+ * Send bulk SMS via smsgateway24 API.
  */
-function sendSms(data, runtimeConfig) {
-  const payload = {
+function sendSmsBulk(batch, runtimeConfig) {
+  const requestBody = {
     token: runtimeConfig.apiToken,
-    sendto: normalizePhone(data.phone),
-    body: data.message,
-    device_id: runtimeConfig.deviceId,
-    sim: runtimeConfig.sim
+    smsdata: batch.map(function(item) {
+      return item.smsItem;
+    })
   };
-
-  if (data.timetosend) {
-    payload.timetosend = data.timetosend;
-  }
-
-  if (data.customerid) {
-    payload.customerid = data.customerid;
-  }
-
-  if (data.urgent !== '') {
-    payload.urgent = data.urgent;
-  }
 
   const options = {
     method: 'post',
-    payload: payload,
+    payload: {
+      datajson: JSON.stringify(requestBody)
+    },
     muteHttpExceptions: true
   };
 
@@ -198,10 +224,17 @@ function sendSms(data, runtimeConfig) {
     parsed = null;
   }
 
+  if (statusCode >= 400) {
+    return {
+      success: false,
+      message: 'HTTP error ' + statusCode + ': ' + responseText,
+      rawResponse: responseText
+    };
+  }
+
   return {
     success: parsed && Number(parsed.error) === 0,
-    message: parsed?.message || responseText,
-    smsId: parsed?.sms_id || null,
+    message: parsed && parsed.message ? parsed.message : responseText,
     rawResponse: responseText
   };
 }
